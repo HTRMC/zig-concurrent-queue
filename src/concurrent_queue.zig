@@ -5,8 +5,8 @@ const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
 
 fn compilerFence(comptime order: std.builtin.AtomicOrder) void {
-    var dummy: u8 = 0;
-    _ = @atomicLoad(u8, &dummy, order);
+    _ = order;
+    asm volatile ("" ::: "memory");
 }
 
 pub const Traits = struct {
@@ -258,7 +258,8 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                     return;
                 }
 
-                self.tail_block.?.data[slot_idx].ptr().* = item;
+                const tb = self.tail_block orelse unreachable;
+                tb.data[slot_idx].ptr().* = item;
                 self.base.tail_index.store(tail +% 1, .release);
             }
 
