@@ -40,10 +40,11 @@ pub fn build(b: *std.Build) void {
 
     const asm_emit = b.addStaticLibrary(.{
         .name = "concurrent-queue-asm",
-        .root_source_file = b.path("src/concurrent_queue.zig"),
+        .root_source_file = b.path("bench/asm_driver.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
+    asm_emit.root_module.addImport("concurrent-queue", lib_mod);
     asm_emit.root_module.strip = false;
     const asm_install = b.addInstallFile(asm_emit.getEmittedAsm(), "asm/concurrent_queue.s");
     const asm_step = b.step("asm", "Emit assembly for hot-path inspection");
