@@ -39,6 +39,19 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    const qbench_exe = b.addExecutable(.{
+        .name = "qbench",
+        .root_source_file = b.path("bench/quick_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    qbench_exe.linkLibC();
+    qbench_exe.root_module.addImport("concurrent-queue", lib_mod);
+    b.installArtifact(qbench_exe);
+    const run_qbench = b.addRunArtifact(qbench_exe);
+    const qbench_step = b.step("qbench", "Quick single-number benchmark");
+    qbench_step.dependOn(&run_qbench.step);
+
     const layout_exe = b.addExecutable(.{
         .name = "layout",
         .root_source_file = b.path("bench/layout.zig"),

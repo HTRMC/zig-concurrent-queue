@@ -134,5 +134,7 @@ pub fn main() !void {
     });
 
     try benchNonBlocking(allocator, stdout);
-    try benchBlocking(allocator, stdout);
+
+    const skip_blocking = std.process.getEnvVarOwned(allocator, "SKIP_BLOCKING") catch null;
+    if (skip_blocking) |s| allocator.free(s) else try benchBlocking(allocator, stdout);
 }
