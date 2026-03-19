@@ -21,7 +21,7 @@ pub fn main() !void {
     });
 
     var total_dequeued = std.atomic.Value(usize).init(0);
-    var done = std.atomic.Value(bool).init(false);
+    var producers_done = std.atomic.Value(usize).init(0);
 
     var producer_threads: [NUM_PRODUCERS]std.Thread = undefined;
     var consumer_threads: [NUM_CONSUMERS]std.Thread = undefined;
@@ -30,38 +30,41 @@ pub fn main() !void {
 
     for (&producer_threads) |*t| {
         t.* = try std.Thread.spawn(.{}, struct {
-            fn run(q: *Q) void {
+            fn run(q: *Q, done: *std.atomic.Value(usize)) void {
                 var tok = q.makeProducerToken() catch return;
                 defer tok.deinit();
                 for (0..ITEMS_PER_PRODUCER) |i| {
                     q.enqueue(&tok, @intCast(i)) catch return;
                 }
+                _ = done.fetchAdd(1, .release);
             }
-        }.run, .{&queue});
+        }.run, .{ &queue, &producers_done });
     }
 
     for (&consumer_threads) |*t| {
         t.* = try std.Thread.spawn(.{}, struct {
-            fn run(q: *Q, dequeued: *std.atomic.Value(usize), finished: *std.atomic.Value(bool)) void {
+            fn run(q: *Q, dequeued: *std.atomic.Value(usize), done: *std.atomic.Value(usize)) void {
+                var ctok = q.makeConsumerToken();
                 var local: usize = 0;
-                while (!finished.load(.acquire) or q.tryDequeue() != null) {
-                    if (q.tryDequeue()) |_| {
+                while (done.load(.acquire) < NUM_PRODUCERS or q.tryDequeue(&ctok) != null) {
+                    if (q.tryDequeue(&ctok)) |_| {
                         local += 1;
                     } else {
                         std.atomic.spinLoopHint();
                     }
                 }
+                while (q.tryDequeue(&ctok)) |_| {
+                    local += 1;
+                }
                 _ = dequeued.fetchAdd(local, .monotonic);
             }
-        }.run, .{ &queue, &total_dequeued, &done });
+        }.run, .{ &queue, &total_dequeued, &producers_done });
     }
 
     for (&producer_threads) |*t| t.join();
-    done.store(true, .release);
-
     for (&consumer_threads) |*t| t.join();
 
-    while (queue.tryDequeue()) |_| {
+    while (queue.tryDequeueAny()) |_| {
         _ = total_dequeued.fetchAdd(1, .monotonic);
     }
 

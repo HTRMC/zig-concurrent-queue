@@ -15,30 +15,24 @@ the generated assembly and verify the codegen is tight.
 
 ## Status
 
-Work in progress. The core single-element enqueue/dequeue path with explicit
-producer tokens works. Still to do:
+Work in progress. Core enqueue/dequeue with explicit producer and consumer
+tokens is functional. Block-index provides O(1) block lookup during dequeue.
+Reference-counted lock-free free list for block recycling.
+
+Still to do:
 
 - [ ] Bulk enqueue / dequeue
-- [ ] Implicit (token-less) producer path via thread-local storage
 - [ ] Blocking queue variant (`wait_dequeue`)
-- [ ] Block-index for O(1) block lookup during dequeue
 - [ ] Pre-allocation / capacity hints
-- [ ] Comprehensive stress tests
 
 ## Quick start
 
 Requires **Zig 0.15+**.
 
 ```bash
-# Run tests
 zig build test
-
-# Run benchmarks
 zig build bench --
-
-# Emit assembly for hot-path inspection
-zig build asm
-# => zig-out/asm/concurrent_queue.s
+zig build asm   # => zig-out/asm/concurrent_queue.s
 ```
 
 ## Usage
@@ -46,23 +40,28 @@ zig build asm
 ```zig
 const ConcurrentQueue = @import("concurrent-queue").ConcurrentQueue;
 
-var queue = ConcurrentQueue(u64, .{}).init(allocator);
+const Q = ConcurrentQueue(u64, .{});
+var queue = Q.init(allocator);
 defer queue.deinit();
 
-var token = try queue.makeProducerToken();
-defer token.deinit();
+var ptok = try queue.makeProducerToken();
+defer ptok.deinit();
+var ctok = queue.makeConsumerToken();
 
-try queue.enqueue(&token, 42);
+try queue.enqueue(&ptok, 42);
 
-if (queue.tryDequeue()) |value| {
+if (queue.tryDequeue(&ctok)) |value| {
     // got 42
+}
+
+// or without tokens (slightly slower, uses thread-local storage):
+try queue.enqueueImplicit(99);
+if (queue.tryDequeueAny()) |value| {
+    _ = value;
 }
 ```
 
 ## Configuration
-
-Pass a custom `Traits` struct to tune block size, index sizes, and consumer
-rotation quota:
 
 ```zig
 const Q = ConcurrentQueue(MyStruct, .{
