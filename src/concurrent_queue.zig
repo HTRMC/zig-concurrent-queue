@@ -67,56 +67,40 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 return flags;
             }
 
-            fn setEmpty(self: *Block, index: usize) void {
+            inline fn setEmpty(self: *Block, index: usize) void {
                 if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
                     self.empty_flags[index & BLOCK_MASK].store(1, .release);
-                } else {
-                    _ = self.elements_completely_dequeued.fetchAdd(1, .release);
                 }
+                _ = self.elements_completely_dequeued.fetchAdd(1, .release);
             }
 
-            fn setManyEmpty(self: *Block, start: usize, count: usize) void {
+            inline fn setManyEmpty(self: *Block, start: usize, count: usize) void {
                 if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
                     var i: usize = 0;
                     while (i < count) : (i += 1) {
                         self.empty_flags[(start + i) & BLOCK_MASK].store(1, .release);
                     }
-                } else {
-                    _ = self.elements_completely_dequeued.fetchAdd(@intCast(count), .release);
                 }
+                _ = self.elements_completely_dequeued.fetchAdd(@intCast(count), .release);
             }
 
-            fn isFullyEmpty(self: *Block) bool {
-                if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
-                    for (&self.empty_flags) |*f| {
-                        if (f.load(.monotonic) == 0) return false;
-                    }
+            inline fn isFullyEmpty(self: *Block) bool {
+                if (self.elements_completely_dequeued.load(.monotonic) == BLOCK_SIZE) {
                     compilerFence(.acquire);
                     return true;
-                } else {
-                    if (self.elements_completely_dequeued.load(.monotonic) == BLOCK_SIZE) {
-                        compilerFence(.acquire);
-                        return true;
-                    }
-                    return false;
                 }
+                return false;
             }
 
-            fn resetEmpty(self: *Block) void {
+            inline fn resetEmpty(self: *Block) void {
                 if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
-                    for (&self.empty_flags) |*f| {
-                        f.store(0, .monotonic);
-                    }
+                    const ptr: [*]u8 = @ptrCast(&self.empty_flags);
+                    @memset(ptr[0 .. BLOCK_SIZE * @sizeOf(Atomic(u32))], 0);
                 }
                 self.elements_completely_dequeued.store(0, .monotonic);
             }
 
-            fn setAllEmpty(self: *Block) void {
-                if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
-                    for (&self.empty_flags) |*f| {
-                        f.store(1, .monotonic);
-                    }
-                }
+            inline fn setAllEmpty(self: *Block) void {
                 self.elements_completely_dequeued.store(BLOCK_SIZE, .monotonic);
             }
         };
@@ -236,7 +220,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 self.block_index.store(new_header, .release);
             }
 
-            fn publishBlockIndexEntry(self: *ExplicitProducer, base: usize, block: *Block) void {
+            inline fn publishBlockIndexEntry(self: *ExplicitProducer, base: usize, block: *Block) void {
                 const entries = self.pr_block_index_entries.?;
                 const front = self.pr_block_index_front;
                 const size = self.pr_block_index_size;
@@ -249,14 +233,14 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 }
             }
 
-            fn signedBlockOffset(a: usize, b: usize) usize {
+            inline fn signedBlockOffset(a: usize, b: usize) usize {
                 const raw = a -% b;
                 const signed: isize = @bitCast(raw);
                 const off: isize = @divTrunc(signed, @as(isize, BLOCK_SIZE));
                 return @bitCast(off);
             }
 
-            fn lookupBlock(bi: *BlockIndexHeader, index: usize) ?*Block {
+            inline fn lookupBlock(bi: *BlockIndexHeader, index: usize) ?*Block {
                 const local_front = bi.front.load(.acquire);
                 const front_entry = bi.entries[local_front & (bi.size - 1)];
                 const block_base = index & ~@as(usize, BLOCK_MASK);
@@ -1141,7 +1125,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         // Internal
         // ================================================================
 
-        fn dequeueFromProducer(self: *Self, prod: *ProducerBase) ?T {
+        inline fn dequeueFromProducer(self: *Self, prod: *ProducerBase) ?T {
             if (prod.is_explicit) {
                 const ep: *ExplicitProducer = @fieldParentPtr("base", prod);
                 return ep.dequeueOne(self);
@@ -1200,7 +1184,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             }
         }
 
-        fn requisitionBlock(self: *Self) !*Block {
+        inline fn requisitionBlock(self: *Self) !*Block {
             if (self.tryBlockFromPool()) |block| return block;
             if (self.freeListTryGet()) |block| {
                 block.resetEmpty();
@@ -1225,7 +1209,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             return null;
         }
 
-        fn tryBlockFromPool(self: *Self) ?*Block {
+        inline fn tryBlockFromPool(self: *Self) ?*Block {
             const pool = self.initial_block_pool orelse return null;
             const idx = self.initial_block_pool_index.fetchAdd(1, .monotonic);
             if (idx >= pool.len) return null;
@@ -1236,7 +1220,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             return &pool[idx];
         }
 
-        fn circularLessThan(a: usize, b: usize) bool {
+        inline fn circularLessThan(a: usize, b: usize) bool {
             const diff = a -% b;
             return diff > (@as(usize, 1) << (@bitSizeOf(usize) - 1));
         }
