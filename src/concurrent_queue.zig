@@ -36,7 +36,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         // Block
         // ================================================================
 
-        const Block = struct {
+        pub const Block = struct {
             data: [BLOCK_SIZE]ElementSlot = undefined,
             empty_flags: if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold)
                 [BLOCK_SIZE]Atomic(u32)
@@ -142,7 +142,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         // Producer base (common fields)
         // ================================================================
 
-        const ProducerBase = struct {
+        pub const ProducerBase = struct {
             tail_index: Atomic(usize) = Atomic(usize).init(0),
             head_index: Atomic(usize) = Atomic(usize).init(0),
             dequeue_optimistic_count: Atomic(usize) = Atomic(usize).init(0),
@@ -162,7 +162,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         // Explicit Producer
         // ================================================================
 
-        const ExplicitProducer = struct {
+        pub const ExplicitProducer = struct {
             base: ProducerBase,
             tail_block: ?*Block = null,
             block_index: Atomic(?*BlockIndexHeader) = Atomic(?*BlockIndexHeader).init(null),

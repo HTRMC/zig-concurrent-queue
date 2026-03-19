@@ -39,6 +39,17 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    const layout_exe = b.addExecutable(.{
+        .name = "layout",
+        .root_source_file = b.path("bench/layout.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    layout_exe.root_module.addImport("concurrent-queue", lib_mod);
+    const run_layout = b.addRunArtifact(layout_exe);
+    const layout_step = b.step("layout", "Print struct layout and cache line analysis");
+    layout_step.dependOn(&run_layout.step);
+
     const asm_emit = b.addStaticLibrary(.{
         .name = "concurrent-queue-asm",
         .root_source_file = b.path("bench/asm_driver.zig"),
