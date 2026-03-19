@@ -1088,16 +1088,14 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                             token.items_consumed = 1;
                             return item;
                         }
-                    } else {
-                        const ip: *ImplicitProducer = @fieldParentPtr("base", prod);
-                        if (ip.dequeueOne(self)) |item| {
-                            token.items_consumed = 1;
-                            return item;
-                        }
                     }
                 }
             }
 
+            return self.tryDequeueSlowPath(token);
+        }
+
+        fn tryDequeueSlowPath(self: *Self, token: *ConsumerToken) ?T {
             return self.tryDequeueFromAnyProducer(token);
         }
 
@@ -1145,7 +1143,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         // Internal
         // ================================================================
 
-        inline fn dequeueFromProducer(self: *Self, prod: *ProducerBase) ?T {
+        fn dequeueFromProducer(self: *Self, prod: *ProducerBase) ?T {
             if (prod.is_explicit) {
                 const ep: *ExplicitProducer = @fieldParentPtr("base", prod);
                 return ep.dequeueOne(self);
