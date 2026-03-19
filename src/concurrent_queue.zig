@@ -952,6 +952,13 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         // Queue state
         // ================================================================
 
+        const SLAB_SIZE = 64;
+
+        const BlockSlab = struct {
+            blocks: [SLAB_SIZE]Block,
+            next: ?*BlockSlab,
+        };
+
         allocator: Allocator,
         producer_list: Atomic(?*ProducerBase) = Atomic(?*ProducerBase).init(null),
         producer_count: Atomic(usize) = Atomic(usize).init(0),
@@ -961,6 +968,8 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         initial_block_pool_index: Atomic(usize) = Atomic(usize).init(0),
         implicit_producer_hash: Atomic(?*ImplicitProducerHash) = Atomic(?*ImplicitProducerHash).init(null),
         implicit_producer_hash_count: Atomic(usize) = Atomic(usize).init(0),
+        slab_list: Atomic(?*BlockSlab) = Atomic(?*BlockSlab).init(null),
+        slab_index: Atomic(usize) = Atomic(usize).init(SLAB_SIZE),
 
         // ================================================================
         // Public API
@@ -1018,6 +1027,13 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
             if (self.initial_block_pool) |pool| {
                 self.allocator.free(pool);
+            }
+
+            var slab = self.slab_list.load(.monotonic);
+            while (slab) |s| {
+                const next = s.next;
+                self.allocator.destroy(s);
+                slab = next;
             }
         }
 
@@ -1215,10 +1231,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 block.free_list_next.store(null, .monotonic);
                 return block;
             }
-            const block = try self.allocator.create(Block);
-            block.* = Block{};
-            block.dynamically_allocated = true;
-            return block;
+            return self.allocateBlockFromSlab();
         }
 
         fn tryRequisitionBlock(self: *Self) ?*Block {
@@ -1241,6 +1254,45 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             pool[idx].free_list_next.store(null, .monotonic);
             pool[idx].next.store(null, .monotonic);
             return &pool[idx];
+        }
+
+        fn allocateBlockFromSlab(self: *Self) !*Block {
+            while (true) {
+                const idx = self.slab_index.fetchAdd(1, .acquire);
+                if (idx < SLAB_SIZE) {
+                    const current_slab = self.slab_list.load(.acquire) orelse {
+                        // Slab not ready yet, another thread is creating it. Spin.
+                        while (self.slab_list.load(.acquire) == null) {
+                            std.atomic.spinLoopHint();
+                        }
+                        const s = self.slab_list.load(.acquire).?;
+                        const block = &s.blocks[idx];
+                        block.* = Block{};
+                        return block;
+                    };
+                    const block = &current_slab.blocks[idx];
+                    block.* = Block{};
+                    return block;
+                }
+
+                // Need a new slab. Only one thread should do this.
+                // Use CAS on slab_index: if we won the race (idx == SLAB_SIZE), we allocate.
+                // Others spin until the new slab is visible.
+                if (idx == SLAB_SIZE) {
+                    const slab = try self.allocator.create(BlockSlab);
+                    slab.* = .{ .blocks = undefined, .next = self.slab_list.load(.monotonic) };
+                    self.slab_list.store(slab, .release);
+                    self.slab_index.store(1, .release);
+                    const block = &slab.blocks[0];
+                    block.* = Block{};
+                    return block;
+                }
+
+                // Another thread is allocating the slab. Spin until slab_index resets.
+                while (self.slab_index.load(.acquire) >= SLAB_SIZE) {
+                    std.atomic.spinLoopHint();
+                }
+            }
         }
 
         inline fn circularLessThan(a: usize, b: usize) bool {
