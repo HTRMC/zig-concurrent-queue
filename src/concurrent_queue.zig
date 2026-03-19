@@ -254,6 +254,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 const slot_idx = tail & BLOCK_MASK;
 
                 if (slot_idx == 0 or self.tail_block == null) {
+                    @branchHint(.unlikely);
                     try self.enqueueNewBlock(parent, tail, item);
                     return;
                 }
@@ -263,7 +264,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 self.base.tail_index.store(tail +% 1, .release);
             }
 
-            fn enqueueNewBlock(self: *ExplicitProducer, parent: *Self, tail: usize, item: T) !void {
+            noinline fn enqueueNewBlock(self: *ExplicitProducer, parent: *Self, tail: usize, item: T) !void {
                 if (self.tail_block) |tb| {
                     const next_opt = tb.next.load(.monotonic);
                     if (next_opt) |next_block| {
@@ -462,13 +463,16 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 return count;
             }
 
-            fn dequeueOne(self: *ExplicitProducer, parent: *Self) ?T {
+            inline fn dequeueOne(self: *ExplicitProducer, parent: *Self) ?T {
                 _ = parent;
                 const tail = self.base.tail_index.load(.monotonic);
                 const overcommit = self.base.dequeue_overcommit.load(.monotonic);
                 const opt_count = self.base.dequeue_optimistic_count.load(.monotonic);
 
-                if (!circularLessThan(opt_count -% overcommit, tail)) return null;
+                if (!circularLessThan(opt_count -% overcommit, tail)) {
+                    @branchHint(.unlikely);
+                    return null;
+                }
 
                 compilerFence(.acquire);
 
@@ -476,13 +480,20 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 const tail2 = self.base.tail_index.load(.acquire);
 
                 if (!circularLessThan(my_dequeue_count -% overcommit, tail2)) {
+                    @branchHint(.unlikely);
                     _ = self.base.dequeue_overcommit.fetchAdd(1, .release);
                     return null;
                 }
 
                 const index = self.base.head_index.fetchAdd(1, .acq_rel);
-                const local_bi = self.block_index.load(.acquire) orelse return null;
-                const block = lookupBlock(local_bi, index) orelse return null;
+                const local_bi = self.block_index.load(.acquire) orelse {
+                    @branchHint(.cold);
+                    return null;
+                };
+                const block = lookupBlock(local_bi, index) orelse {
+                    @branchHint(.cold);
+                    return null;
+                };
                 const slot_idx = index & BLOCK_MASK;
                 const item = block.data[slot_idx].ptr().*;
                 block.setEmpty(slot_idx);
@@ -1112,7 +1123,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             return self.tryDequeueSlowPath(token);
         }
 
-        fn tryDequeueSlowPath(self: *Self, token: *ConsumerToken) ?T {
+        noinline fn tryDequeueSlowPath(self: *Self, token: *ConsumerToken) ?T {
             return self.tryDequeueFromAnyProducer(token);
         }
 
@@ -1224,7 +1235,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             }
         }
 
-        inline fn requisitionBlock(self: *Self) !*Block {
+        noinline fn requisitionBlock(self: *Self) !*Block {
             if (self.tryBlockFromPool()) |block| return block;
             if (self.freeListTryGet()) |block| {
                 block.resetEmpty();
