@@ -1112,12 +1112,18 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 if (ep.dequeueOne(self)) |item| {
                     token.items_consumed += 1;
                     if (token.items_consumed >= CONSUMPTION_QUOTA) {
+                        @branchHint(.unlikely);
                         _ = self.global_explicit_consumer_offset.fetchAdd(1, .monotonic);
                         token.items_consumed = 0;
                     }
                     return item;
                 }
-            } else {
+            }
+            return self.tryDequeueColdPath(token);
+        }
+
+        noinline fn tryDequeueColdPath(self: *Self, token: *ConsumerToken) ?T {
+            if (token.current_explicit == null) {
                 self.updateConsumerAfterRotation(token);
                 if (token.current_producer) |prod| {
                     if (prod.is_explicit) {
@@ -1130,11 +1136,6 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                     }
                 }
             }
-
-            return self.tryDequeueSlowPath(token);
-        }
-
-        noinline fn tryDequeueSlowPath(self: *Self, token: *ConsumerToken) ?T {
             return self.tryDequeueFromAnyProducer(token);
         }
 
