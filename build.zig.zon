@@ -1,7 +1,7 @@
 .{
-    .name = .@"concurrent-queue",
+    .fingerprint = 0x79556012b655e2d4,
+    .name = .concurrent_queue,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

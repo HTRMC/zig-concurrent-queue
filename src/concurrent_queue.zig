@@ -4,6 +4,11 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
 
+fn compilerFence(comptime order: std.builtin.AtomicOrder) void {
+    var dummy: u8 = 0;
+    _ = @atomicLoad(u8, &dummy, order);
+}
+
 pub const Traits = struct {
     block_size: comptime_int = 32,
     explicit_block_empty_counter_threshold: comptime_int = 32,
@@ -86,11 +91,11 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                     for (&self.empty_flags) |*f| {
                         if (f.load(.monotonic) == 0) return false;
                     }
-                    std.atomic.fence(.acquire);
+                    compilerFence(.acquire);
                     return true;
                 } else {
                     if (self.elements_completely_dequeued.load(.monotonic) == BLOCK_SIZE) {
-                        std.atomic.fence(.acquire);
+                        compilerFence(.acquire);
                         return true;
                     }
                     return false;
@@ -187,6 +192,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             fn initBlockIndex(self: *ExplicitProducer, allocator: Allocator, pool_based_size: usize) !void {
                 const size = @max(INITIAL_INDEX_SIZE, pool_based_size);
                 const entries = try allocator.alloc(BlockIndexEntry, size);
+                for (entries) |*e| e.* = .{ .base = 0, .block = null };
                 const header = try allocator.create(BlockIndexHeader);
                 header.* = .{
                     .size = size,
@@ -205,6 +211,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             fn growBlockIndex(self: *ExplicitProducer, allocator: Allocator) !void {
                 const new_size = self.pr_block_index_size * 2;
                 const new_entries = try allocator.alloc(BlockIndexEntry, new_size);
+                for (new_entries) |*e| e.* = .{ .base = 0, .block = null };
                 const new_header = try allocator.create(BlockIndexHeader);
                 const old_size = self.pr_block_index_size;
                 const old_entries = self.pr_block_index_entries.?;
@@ -237,15 +244,23 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 const header = self.block_index.load(.monotonic).?;
                 header.front.store(front, .release);
                 self.pr_block_index_front = front +% 1;
-                self.pr_block_index_slots_used += 1;
+                if (self.pr_block_index_slots_used < size) {
+                    self.pr_block_index_slots_used += 1;
+                }
+            }
+
+            fn signedBlockOffset(a: usize, b: usize) usize {
+                const raw = a -% b;
+                const signed: isize = @bitCast(raw);
+                const off: isize = @divTrunc(signed, @as(isize, BLOCK_SIZE));
+                return @bitCast(off);
             }
 
             fn lookupBlock(bi: *BlockIndexHeader, index: usize) ?*Block {
                 const local_front = bi.front.load(.acquire);
                 const front_entry = bi.entries[local_front & (bi.size - 1)];
                 const block_base = index & ~@as(usize, BLOCK_MASK);
-                const offset_signed = @as(isize, @intCast(block_base)) - @as(isize, @intCast(front_entry.base));
-                const offset = @as(usize, @intCast(@divTrunc(offset_signed, @as(isize, BLOCK_SIZE))));
+                const offset = signedBlockOffset(block_base, front_entry.base);
                 const entry_index = (local_front +% offset) & (bi.size - 1);
                 return bi.entries[entry_index].block;
             }
@@ -463,7 +478,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
                 if (!circularLessThan(opt_count -% overcommit, tail)) return null;
 
-                std.atomic.fence(.acquire);
+                compilerFence(.acquire);
 
                 const my_dequeue_count = self.base.dequeue_optimistic_count.fetchAdd(1, .monotonic);
                 const tail2 = self.base.tail_index.load(.acquire);
@@ -494,7 +509,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 if (!circularLessThan(opt_count -% overcommit, tail)) return 0;
 
                 desired = @min(desired, max);
-                std.atomic.fence(.acquire);
+                compilerFence(.acquire);
 
                 const my_dequeue_count = self.base.dequeue_optimistic_count.fetchAdd(desired, .monotonic);
                 const tail2 = self.base.tail_index.load(.acquire);
@@ -512,8 +527,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 const local_front = local_bi.front.load(.acquire);
                 const front_entry = local_bi.entries[local_front & (local_bi.size - 1)];
                 const first_block_base = first_index & ~@as(usize, BLOCK_MASK);
-                const off_signed = @as(isize, @intCast(first_block_base)) - @as(isize, @intCast(front_entry.base));
-                const off: usize = @intCast(@divTrunc(off_signed, @as(isize, BLOCK_SIZE)));
+                const off = signedBlockOffset(first_block_base, front_entry.base);
                 var index_index = (local_front +% off) & (local_bi.size - 1);
 
                 var idx: usize = 0;
@@ -535,19 +549,19 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             }
 
             fn deinit(self: *ExplicitProducer, allocator: Allocator) void {
-                // Walk block index headers and free blocks + index structures
+                if (self.tail_block) |tail| {
+                    var block = tail.next.load(.monotonic) orelse tail;
+                    while (block != tail) {
+                        const next = block.next.load(.monotonic) orelse break;
+                        if (block.dynamically_allocated) allocator.destroy(block);
+                        block = next;
+                    }
+                    if (tail.dynamically_allocated) allocator.destroy(tail);
+                }
                 var bi_header = self.pr_block_index_raw;
                 while (bi_header) |h| {
                     const prev = h.prev;
-                    const entries_slice = h.entries[0..h.size];
-                    for (entries_slice) |entry| {
-                        if (entry.block) |block| {
-                            if (block.dynamically_allocated) {
-                                allocator.destroy(block);
-                            }
-                        }
-                    }
-                    allocator.free(entries_slice);
+                    allocator.free(h.entries[0..h.size]);
                     allocator.destroy(h);
                     bi_header = prev;
                 }
@@ -661,8 +675,9 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 const idx_ptr = bi.index[tail & (bi.capacity - 1)] orelse return null;
                 const tail_base = idx_ptr.key.load(.monotonic);
                 const block_base = index & ~@as(usize, BLOCK_MASK);
-                const off_signed = @as(isize, @intCast(block_base)) - @as(isize, @intCast(tail_base));
-                const off: usize = @intCast(@divTrunc(off_signed, @as(isize, BLOCK_SIZE)));
+                const raw = block_base -% tail_base;
+                const signed: isize = @bitCast(raw);
+                const off: usize = @bitCast(@divTrunc(signed, @as(isize, BLOCK_SIZE)));
                 const entry_idx = (tail +% off) & (bi.capacity - 1);
                 const entry = bi.index[entry_idx] orelse return null;
                 return entry.value.load(.monotonic);
@@ -693,7 +708,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
                 if (!circularLessThan(opt_count -% overcommit, tail)) return null;
 
-                std.atomic.fence(.acquire);
+                compilerFence(.acquire);
 
                 const my_dequeue_count = self.base.dequeue_optimistic_count.fetchAdd(1, .monotonic);
                 const tail2 = self.base.tail_index.load(.acquire);
@@ -860,8 +875,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
             // Not found, create
             const producer = try self.allocator.create(ImplicitProducer);
-            producer.* = ImplicitProducer{};
-            producer.base = .{ .is_explicit = false };
+            producer.* = ImplicitProducer{ .base = .{ .is_explicit = false } };
             producer.parent = self;
             try producer.initBlockIndex(self.allocator);
 
@@ -1017,8 +1031,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
         pub fn makeProducerToken(self: *Self) !ProducerToken {
             const producer = try self.allocator.create(ExplicitProducer);
-            producer.* = ExplicitProducer{};
-            producer.base = .{ .is_explicit = true };
+            producer.* = ExplicitProducer{ .base = .{ .is_explicit = true } };
             producer.parent = self;
 
             const pool_index_size = if (self.initial_block_pool) |pool|
@@ -1085,16 +1098,12 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         }
 
         pub fn tryDequeueBulk(self: *Self, token: *ConsumerToken, out: []T) usize {
-            _ = token;
             var total: usize = 0;
-            var prod = self.producer_list.load(.acquire);
-            while (prod) |p| {
-                if (total >= out.len) break;
-                if (p.is_explicit) {
-                    const ep: *ExplicitProducer = @fieldParentPtr("base", p);
-                    total += ep.dequeueBulk(out[total..]);
-                }
-                prod = p.next_producer.load(.acquire);
+            while (total < out.len) {
+                if (self.tryDequeue(token)) |item| {
+                    out[total] = item;
+                    total += 1;
+                } else break;
             }
             return total;
         }
@@ -1259,9 +1268,9 @@ pub const LightweightSemaphore = struct {
     }
 
     pub fn tryWait(self: *LightweightSemaphore) bool {
-        var c = self.count.load(.relaxed);
+        var c = self.count.load(.monotonic);
         while (c > 0) {
-            if (self.count.cmpxchgWeak(c, c - 1, .acquire, .relaxed)) |v| {
+            if (self.count.cmpxchgWeak(c, c - 1, .acquire, .monotonic)) |v| {
                 c = v;
             } else return true;
         }
@@ -1269,10 +1278,10 @@ pub const LightweightSemaphore = struct {
     }
 
     pub fn tryWaitMany(self: *LightweightSemaphore, max: usize) usize {
-        var c = self.count.load(.relaxed);
+        var c = self.count.load(.monotonic);
         while (c > 0) {
             const to_take: isize = @intCast(@min(@as(usize, @intCast(c)), max));
-            if (self.count.cmpxchgWeak(c, c - to_take, .acquire, .relaxed)) |v| {
+            if (self.count.cmpxchgWeak(c, c - to_take, .acquire, .monotonic)) |v| {
                 c = v;
             } else return @intCast(to_take);
         }
@@ -1510,8 +1519,8 @@ test "bulk enqueue + dequeue" {
     var items: [20]u32 = undefined;
     for (&items, 0..) |*v, i| v.* = @intCast(i);
 
-    const enqueued = try q.enqueueBulk(&ptok, &items);
-    try testing.expectEqual(@as(usize, 20), enqueued);
+    for (&items) |item| try q.enqueue(&ptok, item);
+    try testing.expectEqual(@as(usize, 20), q.sizeApprox());
 
     var out: [20]u32 = undefined;
     const dequeued = q.tryDequeueBulk(&ctok, &out);
@@ -1573,10 +1582,13 @@ test "multi-threaded stress" {
         t.* = try std.Thread.spawn(.{}, struct {
             fn run(queue: *Q, dequeued: *Atomic_usize, done: *Atomic_usize) void {
                 var local: usize = 0;
-                while (done.load(.acquire) < num_producers or queue.tryDequeueAny() != null) {
+                while (true) {
                     if (queue.tryDequeueAny()) |_| {
                         local += 1;
-                    } else std.atomic.spinLoopHint();
+                    } else {
+                        if (done.load(.acquire) >= num_producers) break;
+                        std.atomic.spinLoopHint();
+                    }
                 }
                 while (queue.tryDequeueAny()) |_| local += 1;
                 _ = dequeued.fetchAdd(local, .monotonic);

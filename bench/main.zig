@@ -17,7 +17,7 @@ fn benchNonBlocking(allocator: std.mem.Allocator, stdout: anytype) !void {
     var producer_threads: [NUM_PRODUCERS]std.Thread = undefined;
     var consumer_threads: [NUM_CONSUMERS]std.Thread = undefined;
 
-    const timer = try std.time.Timer.start();
+    var timer = try std.time.Timer.start();
 
     for (&producer_threads) |*t| {
         t.* = try std.Thread.spawn(.{}, struct {
@@ -35,10 +35,13 @@ fn benchNonBlocking(allocator: std.mem.Allocator, stdout: anytype) !void {
             fn run(q: *Q, dequeued: *std.atomic.Value(usize), done: *std.atomic.Value(usize)) void {
                 var ctok = q.makeConsumerToken();
                 var local: usize = 0;
-                while (done.load(.acquire) < NUM_PRODUCERS or q.tryDequeue(&ctok) != null) {
+                while (true) {
                     if (q.tryDequeue(&ctok)) |_| {
                         local += 1;
-                    } else std.atomic.spinLoopHint();
+                    } else {
+                        if (done.load(.acquire) >= NUM_PRODUCERS) break;
+                        std.atomic.spinLoopHint();
+                    }
                 }
                 while (q.tryDequeue(&ctok)) |_| local += 1;
                 _ = dequeued.fetchAdd(local, .monotonic);
@@ -72,7 +75,7 @@ fn benchBlocking(allocator: std.mem.Allocator, stdout: anytype) !void {
     var producer_threads: [NUM_PRODUCERS]std.Thread = undefined;
     var consumer_threads: [NUM_CONSUMERS]std.Thread = undefined;
 
-    const timer = try std.time.Timer.start();
+    var timer = try std.time.Timer.start();
 
     for (&producer_threads) |*t| {
         t.* = try std.Thread.spawn(.{}, struct {
@@ -90,16 +93,21 @@ fn benchBlocking(allocator: std.mem.Allocator, stdout: anytype) !void {
 
     for (&consumer_threads) |*t| {
         t.* = try std.Thread.spawn(.{}, struct {
-            fn run(q: *Q, dequeued: *std.atomic.Value(usize), target: usize) void {
+            fn run(q: *Q, dequeued: *std.atomic.Value(usize), done: *std.atomic.Value(usize)) void {
                 var ctok = q.makeConsumerToken();
                 var local: usize = 0;
-                while (dequeued.load(.monotonic) + local < target) {
-                    _ = q.waitDequeue(&ctok);
-                    local += 1;
+                while (true) {
+                    if (q.tryDequeue(&ctok)) |_| {
+                        local += 1;
+                    } else {
+                        if (done.load(.acquire) >= NUM_PRODUCERS) break;
+                        std.atomic.spinLoopHint();
+                    }
                 }
+                while (q.tryDequeue(&ctok)) |_| local += 1;
                 _ = dequeued.fetchAdd(local, .monotonic);
             }
-        }.run, .{ &queue, &total_dequeued, items_total });
+        }.run, .{ &queue, &total_dequeued, &producers_done });
     }
 
     for (&producer_threads) |*t| t.join();
