@@ -247,7 +247,8 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             inline fn signedBlockOffset(a: usize, b: usize) usize {
                 const raw = a -% b;
                 const signed: isize = @bitCast(raw);
-                const off: isize = @divTrunc(signed, @as(isize, BLOCK_SIZE));
+                const shift = comptime std.math.log2_int(usize, BLOCK_SIZE);
+                const off: isize = signed >> shift;
                 return @bitCast(off);
             }
 
@@ -1320,8 +1321,8 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         }
 
         inline fn circularLessThan(a: usize, b: usize) bool {
-            const diff = a -% b;
-            return diff > (@as(usize, 1) << (@bitSizeOf(usize) - 1));
+            const diff: isize = @bitCast(a -% b);
+            return diff < 0;
         }
     };
 }
