@@ -10,7 +10,7 @@ static constexpr int NUM_CONSUMERS = 4;
 static constexpr int ITEMS_PER_PRODUCER = 1'000'000;
 
 int main() {
-    moodycamel::ConcurrentQueue<uint64_t> queue(1024);
+    moodycamel::ConcurrentQueue<uint64_t> queue(4096);
     std::atomic<size_t> total_dequeued{0};
     std::atomic<size_t> producers_done{0};
 

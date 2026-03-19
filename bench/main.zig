@@ -8,7 +8,7 @@ const ITEMS_PER_PRODUCER = 1_000_000;
 
 fn benchNonBlocking(allocator: std.mem.Allocator, stdout: anytype) !void {
     const Q = ConcurrentQueue(u64, .{});
-    var queue = try Q.initWithCapacity(allocator, 1024);
+    var queue = try Q.initWithCapacity(allocator, 4096);
     defer queue.deinit();
 
     var total_dequeued = std.atomic.Value(usize).init(0);
@@ -125,9 +125,7 @@ fn benchBlocking(allocator: std.mem.Allocator, stdout: anytype) !void {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
     const stdout = std.io.getStdOut().writer();
 
     try stdout.print("zig-concurrent-queue benchmark\n", .{});

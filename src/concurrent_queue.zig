@@ -249,44 +249,51 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 return bi.entries[entry_index].block;
             }
 
-            fn enqueueOne(self: *ExplicitProducer, parent: *Self, item: T) !void {
+            inline fn enqueueOne(self: *ExplicitProducer, parent: *Self, item: T) !void {
                 const tail = self.base.tail_index.load(.monotonic);
                 const slot_idx = tail & BLOCK_MASK;
 
                 if (slot_idx == 0 or self.tail_block == null) {
-                    // Try to reuse next block in circular chain
-                    if (self.tail_block) |tb| {
-                        const next_opt = tb.next.load(.monotonic);
-                        if (next_opt) |next_block| {
-                            if (next_block.isFullyEmpty()) {
-                                self.tail_block = next_block;
-                                next_block.resetEmpty();
-                                self.publishBlockIndexEntry(tail, next_block);
-                                next_block.data[0].ptr().* = item;
-                                self.base.tail_index.store(tail +% 1, .release);
-                                return;
-                            }
-                        }
-                    }
-
-                    if (self.pr_block_index_slots_used >= self.pr_block_index_size) {
-                        try self.growBlockIndex(parent.allocator);
-                    }
-
-                    const block = try parent.requisitionBlock();
-                    block.resetEmpty();
-
-                    if (self.tail_block) |tb| {
-                        block.next.store(tb.next.load(.monotonic), .monotonic);
-                        tb.next.store(block, .release);
-                    } else {
-                        block.next.store(block, .monotonic);
-                    }
-                    self.tail_block = block;
-                    self.publishBlockIndexEntry(tail, block);
+                    try self.enqueueNewBlock(parent, tail, item);
+                    return;
                 }
 
                 self.tail_block.?.data[slot_idx].ptr().* = item;
+                self.base.tail_index.store(tail +% 1, .release);
+            }
+
+            fn enqueueNewBlock(self: *ExplicitProducer, parent: *Self, tail: usize, item: T) !void {
+                if (self.tail_block) |tb| {
+                    const next_opt = tb.next.load(.monotonic);
+                    if (next_opt) |next_block| {
+                        if (next_block.isFullyEmpty()) {
+                            self.tail_block = next_block;
+                            next_block.resetEmpty();
+                            self.publishBlockIndexEntry(tail, next_block);
+                            next_block.data[0].ptr().* = item;
+                            self.base.tail_index.store(tail +% 1, .release);
+                            return;
+                        }
+                    }
+                }
+
+                if (self.pr_block_index_slots_used >= self.pr_block_index_size) {
+                    try self.growBlockIndex(parent.allocator);
+                }
+
+                const block = try parent.requisitionBlock();
+                block.resetEmpty();
+
+                if (self.tail_block) |tb| {
+                    block.next.store(tb.next.load(.monotonic), .monotonic);
+                    tb.next.store(block, .release);
+                } else {
+                    block.next.store(block, .monotonic);
+                }
+                self.tail_block = block;
+                self.publishBlockIndexEntry(tail, block);
+
+                block.data[0].ptr().* = item;
                 self.base.tail_index.store(tail +% 1, .release);
             }
 
@@ -742,7 +749,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
         pub const ProducerToken = struct {
             producer: *ProducerBase,
-            explicit: ?*ExplicitProducer = null,
+            explicit: *ExplicitProducer,
 
             pub fn deinit(self: *ProducerToken) void {
                 self.producer.active.store(false, .release);
@@ -755,6 +762,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             items_consumed: usize,
             current_producer: ?*ProducerBase,
             desired_producer: ?*ProducerBase,
+            current_explicit: ?*ExplicitProducer = null,
         };
 
         // ================================================================
@@ -1048,33 +1056,45 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             };
         }
 
-        pub fn enqueue(self: *Self, token: *ProducerToken, item: T) !void {
-            const ep = token.explicit orelse return error.InvalidToken;
-            return ep.enqueueOne(self, item);
+        pub inline fn enqueue(self: *Self, token: *ProducerToken, item: T) !void {
+            return token.explicit.enqueueOne(self, item);
         }
 
-        pub fn tryEnqueue(self: *Self, token: *ProducerToken, item: T) bool {
-            const ep = token.explicit orelse return false;
-            return ep.tryEnqueueOne(self, item);
+        pub inline fn tryEnqueue(self: *Self, token: *ProducerToken, item: T) bool {
+            return token.explicit.tryEnqueueOne(self, item);
         }
 
         pub fn enqueueBulk(self: *Self, token: *ProducerToken, items: []const T) !usize {
-            const ep = token.explicit orelse return error.InvalidToken;
-            return ep.enqueueBulk(self, items);
+            return token.explicit.enqueueBulk(self, items);
         }
 
-        pub fn tryDequeue(self: *Self, token: *ConsumerToken) ?T {
-            self.updateConsumerAfterRotation(token);
-
-            if (token.current_producer) |prod| {
-                const item = self.dequeueFromProducer(prod);
-                if (item) |v| {
+        pub inline fn tryDequeue(self: *Self, token: *ConsumerToken) ?T {
+            if (token.current_explicit) |ep| {
+                if (ep.dequeueOne(self)) |item| {
                     token.items_consumed += 1;
                     if (token.items_consumed >= CONSUMPTION_QUOTA) {
                         _ = self.global_explicit_consumer_offset.fetchAdd(1, .monotonic);
                         token.items_consumed = 0;
                     }
-                    return v;
+                    return item;
+                }
+            } else {
+                self.updateConsumerAfterRotation(token);
+                if (token.current_producer) |prod| {
+                    if (prod.is_explicit) {
+                        const ep: *ExplicitProducer = @fieldParentPtr("base", prod);
+                        token.current_explicit = ep;
+                        if (ep.dequeueOne(self)) |item| {
+                            token.items_consumed = 1;
+                            return item;
+                        }
+                    } else {
+                        const ip: *ImplicitProducer = @fieldParentPtr("base", prod);
+                        if (ip.dequeueOne(self)) |item| {
+                            token.items_consumed = 1;
+                            return item;
+                        }
+                    }
                 }
             }
 
@@ -1142,6 +1162,10 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 const item = self.dequeueFromProducer(p);
                 if (item) |v| {
                     token.current_producer = p;
+                    token.current_explicit = if (p.is_explicit)
+                        @as(*ExplicitProducer, @fieldParentPtr("base", p))
+                    else
+                        null;
                     token.items_consumed = 1;
                     return v;
                 }
@@ -1157,6 +1181,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         fn updateConsumerAfterRotation(self: *Self, token: *ConsumerToken) void {
             const global = self.global_explicit_consumer_offset.load(.monotonic);
             if (token.desired_producer == null or token.last_known_global_offset != global) {
+                token.current_explicit = null;
                 const prod_count = self.producer_count.load(.monotonic);
                 if (prod_count == 0) return;
                 if (token.desired_producer == null) {

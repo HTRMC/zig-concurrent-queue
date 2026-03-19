@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    bench_exe.linkLibC();
     bench_exe.root_module.addImport("concurrent-queue", lib_mod);
     b.installArtifact(bench_exe);
 
