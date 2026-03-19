@@ -152,6 +152,12 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             is_explicit: bool,
 
             fn sizeApprox(self: *const ProducerBase) usize {
+                if (self.is_explicit) {
+                    const ep: *const ExplicitProducer = @fieldParentPtr("base", @constCast(self));
+                    const tail = ep.tail_index.load(.monotonic);
+                    const head = ep.head_index.load(.monotonic);
+                    return if (circularLessThan(head, tail)) tail -% head else 0;
+                }
                 const tail = self.tail_index.load(.monotonic);
                 const head = self.head_index.load(.monotonic);
                 return if (circularLessThan(head, tail)) tail -% head else 0;
@@ -163,7 +169,11 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         // ================================================================
 
         pub const ExplicitProducer = struct {
-            base: ProducerBase,
+            // Hot fields first (same layout as C++ ProducerBase)
+            tail_index: Atomic(usize) = Atomic(usize).init(0),
+            head_index: Atomic(usize) = Atomic(usize).init(0),
+            dequeue_optimistic_count: Atomic(usize) = Atomic(usize).init(0),
+            dequeue_overcommit: Atomic(usize) = Atomic(usize).init(0),
             tail_block: ?*Block = null,
             block_index: Atomic(?*BlockIndexHeader) = Atomic(?*BlockIndexHeader).init(null),
             pr_block_index_front: usize = 0,
@@ -172,6 +182,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             pr_block_index_entries: ?[*]BlockIndexEntry = null,
             pr_block_index_raw: ?*BlockIndexHeader = null,
             parent: *Self = undefined,
+            base: ProducerBase = .{ .is_explicit = true },
 
             fn initBlockIndex(self: *ExplicitProducer, allocator: Allocator, pool_based_size: usize) !void {
                 const size = @max(INITIAL_INDEX_SIZE, pool_based_size);
@@ -250,7 +261,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             }
 
             inline fn enqueueOne(self: *ExplicitProducer, parent: *Self, item: T) !void {
-                const tail = self.base.tail_index.load(.monotonic);
+                const tail = self.tail_index.load(.monotonic);
                 const slot_idx = tail & BLOCK_MASK;
 
                 if (slot_idx == 0 or self.tail_block == null) {
@@ -261,7 +272,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
                 const tb = self.tail_block orelse unreachable;
                 tb.data[slot_idx].ptr().* = item;
-                self.base.tail_index.store(tail +% 1, .release);
+                self.tail_index.store(tail +% 1, .release);
             }
 
             noinline fn enqueueNewBlock(self: *ExplicitProducer, parent: *Self, tail: usize, item: T) !void {
@@ -273,7 +284,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                             next_block.resetEmpty();
                             self.publishBlockIndexEntry(tail, next_block);
                             next_block.data[0].ptr().* = item;
-                            self.base.tail_index.store(tail +% 1, .release);
+                            self.tail_index.store(tail +% 1, .release);
                             return;
                         }
                     }
@@ -296,11 +307,11 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 self.publishBlockIndexEntry(tail, block);
 
                 block.data[0].ptr().* = item;
-                self.base.tail_index.store(tail +% 1, .release);
+                self.tail_index.store(tail +% 1, .release);
             }
 
             fn tryEnqueueOne(self: *ExplicitProducer, parent: *Self, item: T) bool {
-                const tail = self.base.tail_index.load(.monotonic);
+                const tail = self.tail_index.load(.monotonic);
                 const slot_idx = tail & BLOCK_MASK;
 
                 if (slot_idx == 0 or self.tail_block == null) {
@@ -313,7 +324,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                                 if (self.pr_block_index_slots_used >= self.pr_block_index_size) return false;
                                 self.publishBlockIndexEntry(tail, next_block);
                                 next_block.data[0].ptr().* = item;
-                                self.base.tail_index.store(tail +% 1, .release);
+                                self.tail_index.store(tail +% 1, .release);
                                 return true;
                             }
                         }
@@ -334,14 +345,14 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 }
 
                 self.tail_block.?.data[slot_idx].ptr().* = item;
-                self.base.tail_index.store(tail +% 1, .release);
+                self.tail_index.store(tail +% 1, .release);
                 return true;
             }
 
             fn enqueueBulk(self: *ExplicitProducer, parent: *Self, items: []const T) !usize {
                 if (items.len == 0) return 0;
                 const count = items.len;
-                const start_tail = self.base.tail_index.load(.monotonic);
+                const start_tail = self.tail_index.load(.monotonic);
                 var current_tail = start_tail;
                 const new_tail = start_tail +% count;
 
@@ -459,15 +470,15 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                     }
                 }
 
-                self.base.tail_index.store(new_tail, .release);
+                self.tail_index.store(new_tail, .release);
                 return count;
             }
 
             inline fn dequeueOne(self: *ExplicitProducer, parent: *Self) ?T {
                 _ = parent;
-                const tail = self.base.tail_index.load(.monotonic);
-                const overcommit = self.base.dequeue_overcommit.load(.monotonic);
-                const opt_count = self.base.dequeue_optimistic_count.load(.monotonic);
+                const tail = self.tail_index.load(.monotonic);
+                const overcommit = self.dequeue_overcommit.load(.monotonic);
+                const opt_count = self.dequeue_optimistic_count.load(.monotonic);
 
                 if (!circularLessThan(opt_count -% overcommit, tail)) {
                     @branchHint(.unlikely);
@@ -476,16 +487,16 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
                 compilerFence(.acquire);
 
-                const my_dequeue_count = self.base.dequeue_optimistic_count.fetchAdd(1, .monotonic);
-                const tail2 = self.base.tail_index.load(.acquire);
+                const my_dequeue_count = self.dequeue_optimistic_count.fetchAdd(1, .monotonic);
+                const tail2 = self.tail_index.load(.acquire);
 
                 if (!circularLessThan(my_dequeue_count -% overcommit, tail2)) {
                     @branchHint(.unlikely);
-                    _ = self.base.dequeue_overcommit.fetchAdd(1, .release);
+                    _ = self.dequeue_overcommit.fetchAdd(1, .release);
                     return null;
                 }
 
-                const index = self.base.head_index.fetchAdd(1, .acq_rel);
+                const index = self.head_index.fetchAdd(1, .acq_rel);
                 const local_bi = self.block_index.load(.acquire) orelse {
                     @branchHint(.cold);
                     return null;
@@ -504,9 +515,9 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 const max = out.len;
                 if (max == 0) return 0;
 
-                const tail = self.base.tail_index.load(.monotonic);
-                const overcommit = self.base.dequeue_overcommit.load(.monotonic);
-                const opt_count = self.base.dequeue_optimistic_count.load(.monotonic);
+                const tail = self.tail_index.load(.monotonic);
+                const overcommit = self.dequeue_overcommit.load(.monotonic);
+                const opt_count = self.dequeue_optimistic_count.load(.monotonic);
                 var desired = tail -% (opt_count -% overcommit);
 
                 if (!circularLessThan(opt_count -% overcommit, tail)) return 0;
@@ -514,18 +525,18 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 desired = @min(desired, max);
                 compilerFence(.acquire);
 
-                const my_dequeue_count = self.base.dequeue_optimistic_count.fetchAdd(desired, .monotonic);
-                const tail2 = self.base.tail_index.load(.acquire);
+                const my_dequeue_count = self.dequeue_optimistic_count.fetchAdd(desired, .monotonic);
+                const tail2 = self.tail_index.load(.acquire);
                 var actual = tail2 -% (my_dequeue_count -% overcommit);
                 if (!circularLessThan(my_dequeue_count -% overcommit, tail2)) actual = 0;
                 actual = @min(desired, actual);
 
                 if (actual < desired) {
-                    _ = self.base.dequeue_overcommit.fetchAdd(desired - actual, .release);
+                    _ = self.dequeue_overcommit.fetchAdd(desired - actual, .release);
                 }
                 if (actual == 0) return 0;
 
-                const first_index = self.base.head_index.fetchAdd(actual, .acq_rel);
+                const first_index = self.head_index.fetchAdd(actual, .acq_rel);
                 const local_bi = self.block_index.load(.acquire) orelse return 0;
                 const local_front = local_bi.front.load(.acquire);
                 const front_entry = local_bi.entries[local_front & (local_bi.size - 1)];
@@ -1051,7 +1062,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
         pub fn makeProducerToken(self: *Self) !ProducerToken {
             const producer = try self.allocator.create(ExplicitProducer);
-            producer.* = ExplicitProducer{ .base = .{ .is_explicit = true } };
+            producer.* = ExplicitProducer{};
             producer.parent = self;
 
             const pool_index_size = if (self.initial_block_pool) |pool|
