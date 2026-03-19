@@ -5,25 +5,18 @@ A lock-free, multi-producer multi-consumer concurrent queue written in Zig.
 Block-based storage, per-producer sub-queues, no locks anywhere.
 Built with Zig's comptime generics and first-class atomics.
 
-## Why
+## Features
 
-Most lock-free queue implementations available for Zig are either simple
-single-producer/single-consumer ring buffers or wrappers around C libraries.
-This is a proper multi-producer multi-consumer queue with per-producer sub-queues
-to minimize contention. The `zig build asm` target makes it easy to inspect
-the generated assembly and verify the codegen is tight.
-
-## Status
-
-Work in progress. Core enqueue/dequeue with explicit producer and consumer
-tokens is functional. Block-index provides O(1) block lookup during dequeue.
-Reference-counted lock-free free list for block recycling.
-
-Still to do:
-
-- [ ] Bulk enqueue / dequeue
-- [ ] Blocking queue variant (`wait_dequeue`)
-- [ ] Pre-allocation / capacity hints
+- Single and bulk enqueue/dequeue
+- Explicit producer and consumer tokens for best throughput
+- Token-less path via thread-local implicit producers
+- `tryEnqueue` for zero-allocation enqueue (only uses pre-allocated blocks)
+- `sizeApprox()` for approximate element count
+- Pre-allocation via `initWithCapacity`
+- Producer-local block reuse (circular chain, avoids global free list in steady state)
+- Reference-counted lock-free free list for block recycling
+- Block-index for O(1) block lookup during dequeue
+- `BlockingConcurrentQueue` with `waitDequeue` (spins then blocks via condition variable)
 
 ## Quick start
 
@@ -38,27 +31,36 @@ zig build asm   # => zig-out/asm/concurrent_queue.s
 ## Usage
 
 ```zig
-const ConcurrentQueue = @import("concurrent-queue").ConcurrentQueue;
+const queue = @import("concurrent-queue");
+const ConcurrentQueue = queue.ConcurrentQueue;
 
 const Q = ConcurrentQueue(u64, .{});
-var queue = Q.init(allocator);
-defer queue.deinit();
+var q = Q.init(allocator);
+// or pre-allocate: var q = try Q.initWithCapacity(allocator, 1024);
+defer q.deinit();
 
-var ptok = try queue.makeProducerToken();
+var ptok = try q.makeProducerToken();
 defer ptok.deinit();
-var ctok = queue.makeConsumerToken();
+var ctok = q.makeConsumerToken();
 
-try queue.enqueue(&ptok, 42);
+// single
+try q.enqueue(&ptok, 42);
+if (q.tryDequeue(&ctok)) |value| _ = value;
 
-if (queue.tryDequeue(&ctok)) |value| {
-    // got 42
-}
+// bulk
+var items = [_]u64{ 1, 2, 3 };
+_ = try q.enqueueBulk(&ptok, &items);
+var out: [3]u64 = undefined;
+_ = q.tryDequeueBulk(&ctok, &out);
 
-// or without tokens (slightly slower, uses thread-local storage):
-try queue.enqueueImplicit(99);
-if (queue.tryDequeueAny()) |value| {
-    _ = value;
-}
+// zero-allocation (only succeeds if pre-allocated space exists)
+_ = q.tryEnqueue(&ptok, 99);
+
+// blocking variant
+const BlockingQ = queue.BlockingConcurrentQueue(u64, .{});
+var bq = BlockingQ.init(allocator);
+defer bq.deinit();
+// bq.waitDequeue(&ctok) blocks until an item is available
 ```
 
 ## Configuration
@@ -69,8 +71,6 @@ const Q = ConcurrentQueue(MyStruct, .{
     .explicit_consumer_consumption_quota = 512,
 });
 ```
-
-See `src/concurrent_queue.zig` for all available knobs.
 
 ## License
 
