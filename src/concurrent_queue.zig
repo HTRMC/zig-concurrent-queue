@@ -73,26 +73,37 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             inline fn setEmpty(self: *Block, index: usize) void {
                 if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
                     self.empty_flags[index & BLOCK_MASK].store(1, .release);
+                } else {
+                    _ = self.elements_completely_dequeued.fetchAdd(1, .release);
                 }
-                _ = self.elements_completely_dequeued.fetchAdd(1, .release);
             }
 
             inline fn setManyEmpty(self: *Block, start: usize, count: usize) void {
                 if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
+                    compilerFence(.release);
                     var i: usize = 0;
                     while (i < count) : (i += 1) {
-                        self.empty_flags[(start + i) & BLOCK_MASK].store(1, .release);
+                        self.empty_flags[(start + i) & BLOCK_MASK].store(1, .monotonic);
                     }
+                } else {
+                    _ = self.elements_completely_dequeued.fetchAdd(@intCast(count), .release);
                 }
-                _ = self.elements_completely_dequeued.fetchAdd(@intCast(count), .release);
             }
 
             inline fn isFullyEmpty(self: *Block) bool {
-                if (self.elements_completely_dequeued.load(.monotonic) == BLOCK_SIZE) {
+                if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
+                    for (&self.empty_flags) |*f| {
+                        if (f.load(.monotonic) == 0) return false;
+                    }
                     compilerFence(.acquire);
                     return true;
+                } else {
+                    if (self.elements_completely_dequeued.load(.monotonic) == BLOCK_SIZE) {
+                        compilerFence(.acquire);
+                        return true;
+                    }
+                    return false;
                 }
-                return false;
             }
 
             inline fn resetEmpty(self: *Block) void {
@@ -172,19 +183,25 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         // ================================================================
 
         pub const ExplicitProducer = struct {
-            // Hot fields first (same layout as C++ ProducerBase)
+            // === Cache line 0: producer-only (enqueue hot path) ===
             tail_index: Atomic(usize) = Atomic(usize).init(0),
-            head_index: Atomic(usize) = Atomic(usize).init(0),
-            dequeue_optimistic_count: Atomic(usize) = Atomic(usize).init(0),
-            dequeue_overcommit: Atomic(usize) = Atomic(usize).init(0),
             tail_block: ?*Block = null,
-            block_index: Atomic(?*BlockIndexHeader) = Atomic(?*BlockIndexHeader).init(null),
             pr_block_index_front: usize = 0,
             pr_block_index_size: usize = 0,
             pr_block_index_slots_used: usize = 0,
             pr_block_index_entries: ?[*]BlockIndexEntry = null,
             pr_block_index_raw: ?*BlockIndexHeader = null,
             parent: *Self = undefined,
+
+            // === Cache line 1: consumer-contended (dequeue hot path) ===
+            _pad0: [64 - @sizeOf(Atomic(usize)) * 8]u8 = undefined,
+            head_index: Atomic(usize) = Atomic(usize).init(0),
+            dequeue_optimistic_count: Atomic(usize) = Atomic(usize).init(0),
+            dequeue_overcommit: Atomic(usize) = Atomic(usize).init(0),
+
+            // === Cache line 2: shared read (rarely written) ===
+            _pad1: [64 - @sizeOf(Atomic(usize)) * 3]u8 = undefined,
+            block_index: Atomic(?*BlockIndexHeader) = Atomic(?*BlockIndexHeader).init(null),
             base: ProducerBase = .{ .is_explicit = true },
 
             fn initBlockIndex(self: *ExplicitProducer, allocator: Allocator, pool_based_size: usize) !void {
@@ -1265,7 +1282,10 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 block.free_list_next.store(null, .monotonic);
                 return block;
             }
-            return self.allocateBlockFromSlab();
+            const block = try self.allocator.create(Block);
+            block.* = Block{};
+            block.dynamically_allocated = true;
+            return block;
         }
 
         fn tryRequisitionBlock(self: *Self) ?*Block {
