@@ -1265,10 +1265,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 block.free_list_next.store(null, .monotonic);
                 return block;
             }
-            const block = try self.allocator.create(Block);
-            block.* = Block{};
-            block.dynamically_allocated = true;
-            return block;
+            return self.allocateBlockFromSlab();
         }
 
         fn tryRequisitionBlock(self: *Self) ?*Block {
@@ -1295,34 +1292,33 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
         fn allocateBlockFromSlab(self: *Self) !*Block {
             while (true) {
-                // Load current slab, allocate one if none exists
-                var slab = self.slab_list.load(.acquire) orelse blk: {
-                    const new_slab = try self.allocator.create(BlockSlab);
-                    new_slab.* = .{ .blocks = undefined, .next = null };
-                    // CAS to install — if another thread beat us, use theirs
-                    if (self.slab_list.cmpxchgStrong(null, new_slab, .release, .acquire)) |winner| {
-                        self.allocator.destroy(new_slab);
-                        break :blk winner.?;
-                    }
-                    break :blk new_slab;
-                };
+                const slab = self.slab_list.load(.acquire);
 
-                // Try to claim a slot from this slab
-                const idx = slab.index.fetchAdd(1, .monotonic);
-                if (idx < SLAB_SIZE) {
-                    const block = &slab.blocks[idx];
-                    block.* = Block{};
-                    return block;
+                if (slab) |s| {
+                    // Try to claim a slot from the current slab
+                    const idx = s.index.fetchAdd(1, .monotonic);
+                    if (idx < SLAB_SIZE) {
+                        const block = &s.blocks[idx];
+                        block.* = Block{};
+                        return block;
+                    }
+                    // Slab full — fall through to create a new one
                 }
 
-                // Slab is full — allocate a new one and CAS it in
+                // Allocate a new slab — reserve block 0 for ourselves
                 const new_slab = try self.allocator.create(BlockSlab);
                 new_slab.* = .{ .blocks = undefined, .next = slab };
-                if (self.slab_list.cmpxchgStrong(slab, new_slab, .release, .acquire)) |_| {
-                    // Another thread installed a new slab first — use theirs
+                new_slab.index = Atomic(usize).init(1); // block 0 is ours
+
+                // CAS to install as head. If we lose, free ours and retry.
+                if (self.slab_list.cmpxchgWeak(slab, new_slab, .release, .acquire)) |_| {
                     self.allocator.destroy(new_slab);
+                    continue;
                 }
-                // Either way, retry from the top with the new current slab
+
+                const block = &new_slab.blocks[0];
+                block.* = Block{};
+                return block;
             }
         }
 
