@@ -73,37 +73,26 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             inline fn setEmpty(self: *Block, index: usize) void {
                 if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
                     self.empty_flags[index & BLOCK_MASK].store(1, .release);
-                } else {
-                    _ = self.elements_completely_dequeued.fetchAdd(1, .acq_rel);
                 }
+                _ = self.elements_completely_dequeued.fetchAdd(1, .release);
             }
 
             inline fn setManyEmpty(self: *Block, start: usize, count: usize) void {
                 if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
-                    compilerFence(.release);
                     var i: usize = 0;
                     while (i < count) : (i += 1) {
-                        self.empty_flags[(start + i) & BLOCK_MASK].store(1, .monotonic);
+                        self.empty_flags[(start + i) & BLOCK_MASK].store(1, .release);
                     }
-                } else {
-                    _ = self.elements_completely_dequeued.fetchAdd(@intCast(count), .acq_rel);
                 }
+                _ = self.elements_completely_dequeued.fetchAdd(@intCast(count), .release);
             }
 
             inline fn isFullyEmpty(self: *Block) bool {
-                if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
-                    for (&self.empty_flags) |*f| {
-                        if (f.load(.monotonic) == 0) return false;
-                    }
+                if (self.elements_completely_dequeued.load(.monotonic) == BLOCK_SIZE) {
                     compilerFence(.acquire);
                     return true;
-                } else {
-                    if (self.elements_completely_dequeued.load(.monotonic) == BLOCK_SIZE) {
-                        compilerFence(.acquire);
-                        return true;
-                    }
-                    return false;
                 }
+                return false;
             }
 
             inline fn resetEmpty(self: *Block) void {
@@ -125,7 +114,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
         const BlockIndexEntry = struct {
             base: usize,
-            block: Atomic(?*Block),
+            block: ?*Block,
         };
 
         const BlockIndexHeader = struct {
@@ -201,7 +190,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             fn initBlockIndex(self: *ExplicitProducer, allocator: Allocator, pool_based_size: usize) !void {
                 const size = @max(INITIAL_INDEX_SIZE, pool_based_size);
                 const entries = try allocator.alloc(BlockIndexEntry, size);
-                for (entries) |*e| e.* = .{ .base = 0, .block = Atomic(?*Block).init(null) };
+                for (entries) |*e| e.* = .{ .base = 0, .block = null };
                 const header = try allocator.create(BlockIndexHeader);
                 header.* = .{
                     .size = size,
@@ -220,7 +209,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             fn growBlockIndex(self: *ExplicitProducer, allocator: Allocator) !void {
                 const new_size = self.pr_block_index_size * 2;
                 const new_entries = try allocator.alloc(BlockIndexEntry, new_size);
-                for (new_entries) |*e| e.* = .{ .base = 0, .block = Atomic(?*Block).init(null) };
+                for (new_entries) |*e| e.* = .{ .base = 0, .block = null };
                 const new_header = try allocator.create(BlockIndexHeader);
                 const old_size = self.pr_block_index_size;
                 const old_entries = self.pr_block_index_entries.?;
@@ -252,7 +241,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 // Write fields separately (matching C++ two-store pattern)
                 const entry = &entries[front & (size - 1)];
                 entry.base = base_val;
-                entry.block.store(block, .release);
+                entry.block = block;
                 const header = self.block_index.load(.monotonic).?;
                 header.front.store(front, .release);
                 self.pr_block_index_front = (front +% 1) & (size - 1);
@@ -261,7 +250,8 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             inline fn signedBlockOffset(a: usize, b: usize) usize {
                 const raw = a -% b;
                 const signed: isize = @bitCast(raw);
-                const off: isize = @divTrunc(signed, @as(isize, BLOCK_SIZE));
+                const shift = comptime std.math.log2_int(usize, BLOCK_SIZE);
+                const off: isize = signed >> shift;
                 return @bitCast(off);
             }
 
@@ -271,7 +261,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 const block_base = index & ~@as(usize, BLOCK_MASK);
                 const offset = signedBlockOffset(block_base, front_entry.base);
                 const entry_index = (local_front +% offset) & (bi.size - 1);
-                return bi.entries[entry_index].block.load(.acquire);
+                return bi.entries[entry_index].block;
             }
 
             inline fn enqueueOne(self: *ExplicitProducer, parent: *Self, item: T) !void {
@@ -557,7 +547,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 while (idx < actual) {
                     var end = ((current & ~@as(usize, BLOCK_MASK)) +% BLOCK_SIZE);
                     if (first_index +% actual < end) end = first_index +% actual;
-                    const block = local_bi.entries[index_index].block.load(.acquire) orelse break;
+                    const block = local_bi.entries[index_index].block orelse break;
                     const first_in_block = current;
                     while (current != end) {
                         out[idx] = block.data[current & BLOCK_MASK].ptr().*;
