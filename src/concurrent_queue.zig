@@ -73,26 +73,37 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             inline fn setEmpty(self: *Block, index: usize) void {
                 if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
                     self.empty_flags[index & BLOCK_MASK].store(1, .release);
+                } else {
+                    _ = self.elements_completely_dequeued.fetchAdd(1, .acq_rel);
                 }
-                _ = self.elements_completely_dequeued.fetchAdd(1, .acq_rel);
             }
 
             inline fn setManyEmpty(self: *Block, start: usize, count: usize) void {
                 if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
+                    compilerFence(.release);
                     var i: usize = 0;
                     while (i < count) : (i += 1) {
-                        self.empty_flags[(start + i) & BLOCK_MASK].store(1, .release);
+                        self.empty_flags[(start + i) & BLOCK_MASK].store(1, .monotonic);
                     }
+                } else {
+                    _ = self.elements_completely_dequeued.fetchAdd(@intCast(count), .acq_rel);
                 }
-                _ = self.elements_completely_dequeued.fetchAdd(@intCast(count), .acq_rel);
             }
 
             inline fn isFullyEmpty(self: *Block) bool {
-                if (self.elements_completely_dequeued.load(.monotonic) == BLOCK_SIZE) {
+                if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
+                    for (&self.empty_flags) |*f| {
+                        if (f.load(.monotonic) == 0) return false;
+                    }
                     compilerFence(.acquire);
                     return true;
+                } else {
+                    if (self.elements_completely_dequeued.load(.monotonic) == BLOCK_SIZE) {
+                        compilerFence(.acquire);
+                        return true;
+                    }
+                    return false;
                 }
-                return false;
             }
 
             inline fn resetEmpty(self: *Block) void {
@@ -1264,7 +1275,10 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 block.free_list_next.store(null, .monotonic);
                 return block;
             }
-            return self.allocateBlockFromSlab();
+            // Direct allocation (bypass slab allocator for debugging)
+            const block = try self.allocator.create(Block);
+            block.* = Block{};
+            return block;
         }
 
         fn tryRequisitionBlock(self: *Self) ?*Block {
