@@ -790,6 +790,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
         pub const ConsumerToken = struct {
             initial_offset: usize,
+            last_known_global_offset: usize,
             items_consumed: usize,
             current_producer: ?*ProducerBase,
             desired_producer: ?*ProducerBase,
@@ -995,6 +996,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         producer_list: Atomic(?*ProducerBase) = Atomic(?*ProducerBase).init(null),
         producer_count: Atomic(usize) = Atomic(usize).init(0),
         free_list_head: Atomic(?*Block) = Atomic(?*Block).init(null),
+        global_explicit_consumer_offset: Atomic(usize) = Atomic(usize).init(0),
         initial_block_pool: ?[]Block = null,
         initial_block_pool_index: Atomic(usize) = Atomic(usize).init(0),
         implicit_producer_hash: Atomic(?*ImplicitProducerHash) = Atomic(?*ImplicitProducerHash).init(null),
@@ -1095,6 +1097,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             };
             return ConsumerToken{
                 .initial_offset = offset.counter.fetchAdd(1, .monotonic),
+                .last_known_global_offset = 0,
                 .items_consumed = 0,
                 .current_producer = null,
                 .desired_producer = null,
@@ -1119,7 +1122,8 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                     token.items_consumed += 1;
                     if (token.items_consumed >= CONSUMPTION_QUOTA) {
                         @branchHint(.unlikely);
-                        self.rotateConsumer(token);
+                        _ = self.global_explicit_consumer_offset.fetchAdd(1, .monotonic);
+                        token.items_consumed = 0;
                     }
                     return item;
                 }
@@ -1129,9 +1133,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
         noinline fn tryDequeueColdPath(self: *Self, token: *ConsumerToken) ?T {
             if (token.current_explicit == null) {
-                if (token.desired_producer == null) {
-                    self.initConsumerProducer(token);
-                }
+                self.updateConsumerAfterRotation(token);
                 if (token.current_producer) |prod| {
                     if (prod.is_explicit) {
                         const ep: *ExplicitProducer = @fieldParentPtr("base", prod);
@@ -1223,49 +1225,35 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             return null;
         }
 
-        /// Per-consumer local rotation: advance to the next producer in the
-        /// list.  No shared atomic — each consumer rotates independently,
-        /// avoiding the cache-line bouncing of a global offset counter.
-        noinline fn rotateConsumer(_: *Self, token: *ConsumerToken) void {
-            token.items_consumed = 0;
-            if (token.current_explicit) |ep| {
-                const next = ep.base.next_producer.load(.acquire);
-                // Wrap handled lazily: if next is null we keep desired as-is
-                // and let tryDequeueFromAnyProducer pick up from the head.
-                if (next) |n| {
-                    token.desired_producer = n;
-                    token.current_producer = n;
-                    token.current_explicit = if (n.is_explicit)
-                        @as(*ExplicitProducer, @fieldParentPtr("base", n))
-                    else
-                        null;
-                    return;
+        fn updateConsumerAfterRotation(self: *Self, token: *ConsumerToken) void {
+            const global = self.global_explicit_consumer_offset.load(.monotonic);
+            if (token.desired_producer == null or token.last_known_global_offset != global) {
+                token.current_explicit = null;
+                const prod_count = self.producer_count.load(.monotonic);
+                if (prod_count == 0) return;
+                if (token.desired_producer == null) {
+                    const target = prod_count - 1 - (token.initial_offset % prod_count);
+                    var p = self.producer_list.load(.acquire);
+                    var i: usize = 0;
+                    while (p) |producer| {
+                        if (i == target) { token.desired_producer = producer; break; }
+                        i += 1;
+                        p = producer.next_producer.load(.acquire);
+                    }
+                } else {
+                    const delta = @min(global -% token.last_known_global_offset, prod_count);
+                    var p = token.desired_producer;
+                    var i: usize = 0;
+                    while (i < delta) : (i += 1) {
+                        if (p) |producer| p = producer.next_producer.load(.acquire);
+                        if (p == null) p = self.producer_list.load(.acquire);
+                    }
+                    token.desired_producer = p;
                 }
+                token.current_producer = token.desired_producer;
+                token.items_consumed = 0;
+                token.last_known_global_offset = global;
             }
-            // Wrap around or non-explicit: clear cached producer so the cold
-            // path re-acquires from the head of the producer list.
-            token.current_explicit = null;
-            token.current_producer = null;
-            token.desired_producer = null;
-        }
-
-        /// One-time assignment: spread consumers across producers using
-        /// their unique initial_offset.
-        fn initConsumerProducer(self: *Self, token: *ConsumerToken) void {
-            const prod_count = self.producer_count.load(.monotonic);
-            if (prod_count == 0) return;
-            const target = prod_count - 1 - (token.initial_offset % prod_count);
-            var p = self.producer_list.load(.acquire);
-            var i: usize = 0;
-            while (p) |producer| {
-                if (i == target) {
-                    token.desired_producer = producer;
-                    break;
-                }
-                i += 1;
-                p = producer.next_producer.load(.acquire);
-            }
-            token.current_producer = token.desired_producer;
         }
 
         noinline fn requisitionBlock(self: *Self) !*Block {
