@@ -377,18 +377,15 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 if (items.len == 0) return 0;
                 const count = items.len;
                 const start_tail = self.tail_index.load(.monotonic);
-                var current_tail = start_tail;
                 const new_tail = start_tail +% count;
 
+                // Match C++: currentTailIndex starts at the PREVIOUS block base,
+                // and blockBaseDiff / BLOCK_SIZE gives the number of new blocks.
                 const start_block_base = (start_tail -% 1) & ~@as(usize, BLOCK_MASK);
                 const end_block_base = (start_tail +% count -% 1) & ~@as(usize, BLOCK_MASK);
-                var blocks_needed: usize = 0;
-                if (start_tail & BLOCK_MASK == 0 or self.tail_block == null) {
-                    blocks_needed = (end_block_base -% start_block_base) / BLOCK_SIZE + 1;
-                } else {
-                    blocks_needed = (end_block_base -% (start_block_base +% BLOCK_SIZE)) / BLOCK_SIZE + 1;
-                    if (end_block_base == start_block_base) blocks_needed = 0;
-                }
+                var current_tail = start_block_base;
+                const block_base_diff = end_block_base -% start_block_base;
+                var blocks_needed: usize = if (block_base_diff > 0) block_base_diff / BLOCK_SIZE else 0;
 
                 const orig_front = self.pr_block_index_front;
                 const orig_slots_used = self.pr_block_index_slots_used;
@@ -1277,10 +1274,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 block.free_list_next.store(null, .monotonic);
                 return block;
             }
-            const block = try self.allocator.create(Block);
-            block.* = Block{};
-            block.dynamically_allocated = true;
-            return block;
+            return self.allocateBlockFromSlab();
         }
 
         fn tryRequisitionBlock(self: *Self) ?*Block {
