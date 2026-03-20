@@ -1227,6 +1227,9 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             if (token.desired_producer == null and tail == null) return false;
 
             const prod_count = self.producer_count.load(.monotonic);
+            // Guard: producer_list is updated before producer_count, so we
+            // can see tail != null with prod_count == 0. Retry next call.
+            if (prod_count == 0) return false;
             const global = self.global_explicit_consumer_offset.load(.monotonic);
 
             if (token.desired_producer == null) {
