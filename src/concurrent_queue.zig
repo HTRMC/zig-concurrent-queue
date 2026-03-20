@@ -45,7 +45,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 initFlags()
             else {},
             elements_completely_dequeued: Atomic(u32) = Atomic(u32).init(0),
-            next: Atomic(?*Block) = Atomic(?*Block).init(null),
+            next: ?*Block = null,
             free_list_refs: Atomic(u32) = Atomic(u32).init(0),
             free_list_next: Atomic(?*Block) = Atomic(?*Block).init(null),
             dynamically_allocated: bool = false,
@@ -300,7 +300,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
             noinline fn enqueueNewBlock(self: *ExplicitProducer, parent: *Self, tail: usize, item: T) !void {
                 if (self.tail_block) |tb| {
-                    const next_opt = tb.next.load(.monotonic);
+                    const next_opt = tb.next;
                     if (next_opt) |next_block| {
                         if (next_block.isFullyEmpty()) {
                             self.tail_block = next_block;
@@ -321,10 +321,10 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 block.resetEmpty();
 
                 if (self.tail_block) |tb| {
-                    block.next.store(tb.next.load(.monotonic), .monotonic);
-                    tb.next.store(block, .release);
+                    block.next = tb.next;
+                    tb.next = block;
                 } else {
-                    block.next.store(block, .monotonic);
+                    block.next = block;
                 }
                 self.tail_block = block;
                 self.pr_block_index_slots_used += 1;
@@ -340,7 +340,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
                 if (slot_idx == 0 or self.tail_block == null) {
                     if (self.tail_block) |tb| {
-                        const next_opt = tb.next.load(.monotonic);
+                        const next_opt = tb.next;
                         if (next_opt) |next_block| {
                             if (next_block.isFullyEmpty()) {
                                 self.tail_block = next_block;
@@ -358,10 +358,10 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                     const block = parent.tryRequisitionBlock() orelse return false;
                     block.resetEmpty();
                     if (self.tail_block) |tb| {
-                        block.next.store(tb.next.load(.monotonic), .monotonic);
-                        tb.next.store(block, .release);
+                        block.next = tb.next;
+                        tb.next = block;
                     } else {
-                        block.next.store(block, .monotonic);
+                        block.next = block;
                     }
                     self.tail_block = block;
                     self.pr_block_index_slots_used += 1;
@@ -399,7 +399,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 if (blocks_needed > 0 and self.tail_block != null) {
                     var tb = self.tail_block.?;
                     while (blocks_needed > 0) {
-                        const next_opt = tb.next.load(.monotonic);
+                        const next_opt = tb.next;
                         if (next_opt) |next_block| {
                             if (first_allocated != null and next_block == first_allocated.?) break;
                             if (!next_block.isFullyEmpty()) break;
@@ -432,10 +432,10 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                     block.setAllEmpty();
                     current_tail = (current_tail & ~@as(usize, BLOCK_MASK)) +% BLOCK_SIZE;
                     if (self.tail_block) |tb| {
-                        block.next.store(tb.next.load(.monotonic), .monotonic);
-                        tb.next.store(block, .release);
+                        block.next = tb.next;
+                        tb.next = block;
                     } else {
-                        block.next.store(block, .monotonic);
+                        block.next = block;
                     }
                     self.tail_block = block;
                     if (first_allocated == null) first_allocated = block;
@@ -449,7 +449,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                     while (true) {
                         b.resetEmpty();
                         if (b == self.tail_block.?) break;
-                        b = b.next.load(.monotonic) orelse break;
+                        b = b.next orelse break;
                     }
                 }
 
@@ -483,7 +483,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                     current_tail +%= n;
 
                     if (item_idx < count) {
-                        self.tail_block = tb.next.load(.monotonic);
+                        self.tail_block = tb.next;
                     }
                 }
 
@@ -575,9 +575,9 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
             fn deinit(self: *ExplicitProducer, allocator: Allocator) void {
                 if (self.tail_block) |tail| {
-                    var block = tail.next.load(.monotonic) orelse tail;
+                    var block = tail.next orelse tail;
                     while (block != tail) {
-                        const next = block.next.load(.monotonic) orelse break;
+                        const next = block.next orelse break;
                         if (block.dynamically_allocated) allocator.destroy(block);
                         block = next;
                     }
@@ -1196,8 +1196,8 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         }
 
         fn tryDequeueFromAnyProducer(self: *Self, token: *ConsumerToken) ?T {
-            // Match C++: start from current_producer->next_prod(), not current_producer.
-            // This avoids re-trying the producer that just failed.
+            // Start from current_producer->next_prod() to avoid re-trying
+            // the producer that just failed.
             const tail = self.producer_list.load(.acquire);
             const current = token.current_producer orelse tail;
             var ptr: ?*ProducerBase = if (current) |c| c.next_producer.load(.acquire) else null;
@@ -1208,6 +1208,10 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 const item = self.dequeueFromProducer(p);
                 if (item) |v| {
                     token.current_producer = p;
+                    // Also update desired_producer so the next rotation advances
+                    // from this position. This breaks lockstep at 2P/2C where both
+                    // consumers otherwise rotate in sync forever.
+                    token.desired_producer = p;
                     token.current_explicit = if (p.is_explicit)
                         @as(*ExplicitProducer, @fieldParentPtr("base", p))
                     else
@@ -1300,7 +1304,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             pool[idx].resetEmpty();
             pool[idx].free_list_refs.store(0, .monotonic);
             pool[idx].free_list_next.store(null, .monotonic);
-            pool[idx].next.store(null, .monotonic);
+            pool[idx].next = null;
             return &pool[idx];
         }
 
