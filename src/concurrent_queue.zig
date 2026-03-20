@@ -985,6 +985,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         const SLAB_SIZE = 64;
 
         const BlockSlab = struct {
+            index: Atomic(usize) = Atomic(usize).init(0),
             blocks: [SLAB_SIZE]Block,
             next: ?*BlockSlab,
         };
@@ -998,7 +999,6 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         implicit_producer_hash: Atomic(?*ImplicitProducerHash) = Atomic(?*ImplicitProducerHash).init(null),
         implicit_producer_hash_count: Atomic(usize) = Atomic(usize).init(0),
         slab_list: Atomic(?*BlockSlab) = Atomic(?*BlockSlab).init(null),
-        slab_index: Atomic(usize) = Atomic(usize).init(SLAB_SIZE),
 
         // ================================================================
         // Public API
@@ -1275,10 +1275,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 block.free_list_next.store(null, .monotonic);
                 return block;
             }
-            // Direct allocation (bypass slab allocator for debugging)
-            const block = try self.allocator.create(Block);
-            block.* = Block{};
-            return block;
+            return self.allocateBlockFromSlab();
         }
 
         fn tryRequisitionBlock(self: *Self) ?*Block {
@@ -1305,40 +1302,34 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
 
         fn allocateBlockFromSlab(self: *Self) !*Block {
             while (true) {
-                const idx = self.slab_index.fetchAdd(1, .acquire);
+                // Load current slab, allocate one if none exists
+                var slab = self.slab_list.load(.acquire) orelse blk: {
+                    const new_slab = try self.allocator.create(BlockSlab);
+                    new_slab.* = .{ .blocks = undefined, .next = null };
+                    // CAS to install — if another thread beat us, use theirs
+                    if (self.slab_list.cmpxchgStrong(null, new_slab, .release, .acquire)) |winner| {
+                        self.allocator.destroy(new_slab);
+                        break :blk winner.?;
+                    }
+                    break :blk new_slab;
+                };
+
+                // Try to claim a slot from this slab
+                const idx = slab.index.fetchAdd(1, .monotonic);
                 if (idx < SLAB_SIZE) {
-                    const current_slab = self.slab_list.load(.acquire) orelse {
-                        // Slab not ready yet, another thread is creating it. Spin.
-                        while (self.slab_list.load(.acquire) == null) {
-                            std.atomic.spinLoopHint();
-                        }
-                        const s = self.slab_list.load(.acquire).?;
-                        const block = &s.blocks[idx];
-                        block.* = Block{};
-                        return block;
-                    };
-                    const block = &current_slab.blocks[idx];
+                    const block = &slab.blocks[idx];
                     block.* = Block{};
                     return block;
                 }
 
-                // Need a new slab. Only one thread should do this.
-                // Use CAS on slab_index: if we won the race (idx == SLAB_SIZE), we allocate.
-                // Others spin until the new slab is visible.
-                if (idx == SLAB_SIZE) {
-                    const slab = try self.allocator.create(BlockSlab);
-                    slab.* = .{ .blocks = undefined, .next = self.slab_list.load(.monotonic) };
-                    self.slab_list.store(slab, .release);
-                    self.slab_index.store(1, .release);
-                    const block = &slab.blocks[0];
-                    block.* = Block{};
-                    return block;
+                // Slab is full — allocate a new one and CAS it in
+                const new_slab = try self.allocator.create(BlockSlab);
+                new_slab.* = .{ .blocks = undefined, .next = slab };
+                if (self.slab_list.cmpxchgStrong(slab, new_slab, .release, .acquire)) |_| {
+                    // Another thread installed a new slab first — use theirs
+                    self.allocator.destroy(new_slab);
                 }
-
-                // Another thread is allocating the slab. Spin until slab_index resets.
-                while (self.slab_index.load(.acquire) >= SLAB_SIZE) {
-                    std.atomic.spinLoopHint();
-                }
+                // Either way, retry from the top with the new current slab
             }
         }
 
