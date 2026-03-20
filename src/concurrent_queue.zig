@@ -1265,7 +1265,10 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 block.free_list_next.store(null, .monotonic);
                 return block;
             }
-            return self.allocateBlockFromSlab();
+            const block = try self.allocator.create(Block);
+            block.* = Block{};
+            block.dynamically_allocated = true;
+            return block;
         }
 
         fn tryRequisitionBlock(self: *Self) ?*Block {
