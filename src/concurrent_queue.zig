@@ -39,7 +39,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         pub const Block = struct {
             data: [BLOCK_SIZE]ElementSlot = undefined,
             empty_flags: if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold)
-                [BLOCK_SIZE]Atomic(u32)
+                [BLOCK_SIZE]Atomic(u8)
             else
                 void = if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold)
                 initFlags()
@@ -62,10 +62,10 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             const element_size = @max(@sizeOf(T), 1);
             const element_align = @max(@alignOf(T), 1);
 
-            fn initFlags() [BLOCK_SIZE]Atomic(u32) {
-                var flags: [BLOCK_SIZE]Atomic(u32) = undefined;
+            fn initFlags() [BLOCK_SIZE]Atomic(u8) {
+                var flags: [BLOCK_SIZE]Atomic(u8) = undefined;
                 for (&flags) |*f| {
-                    f.* = Atomic(u32).init(0);
+                    f.* = Atomic(u8).init(0);
                 }
                 return flags;
             }
@@ -109,7 +109,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             inline fn resetEmpty(self: *Block) void {
                 if (BLOCK_SIZE <= traits.explicit_block_empty_counter_threshold) {
                     const ptr: [*]u8 = @ptrCast(&self.empty_flags);
-                    @memset(ptr[0 .. BLOCK_SIZE * @sizeOf(Atomic(u32))], 0);
+                    @memset(ptr[0 .. BLOCK_SIZE * @sizeOf(Atomic(u8))], 0);
                 }
                 self.elements_completely_dequeued.store(0, .monotonic);
             }
@@ -512,14 +512,8 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 }
 
                 const index = self.head_index.fetchAdd(1, .acq_rel);
-                const local_bi = self.block_index.load(.acquire) orelse {
-                    @branchHint(.cold);
-                    return null;
-                };
-                const block = lookupBlock(local_bi, index) orelse {
-                    @branchHint(.cold);
-                    return null;
-                };
+                const local_bi = self.block_index.load(.acquire).?;
+                const block = lookupBlock(local_bi, index).?;
                 const slot_idx = index & BLOCK_MASK;
                 const item = block.data[slot_idx].ptr().*;
                 block.setEmpty(slot_idx);
