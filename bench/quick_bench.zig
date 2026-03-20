@@ -48,6 +48,9 @@ pub fn main() !void {
     const ns = timer.read();
     const items: f64 = NP * N;
     const ops = items / (@as(f64, @floatFromInt(ns)) / 1e9);
-    const w = std.io.getStdOut().writer();
+    var wbuf: [256]u8 = undefined;
+    var fw = std.fs.File.stdout().writer(&wbuf);
+    const w = &fw.interface;
     try w.print("{d:.0}\n", .{ops});
+    try w.flush();
 }

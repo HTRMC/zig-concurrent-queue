@@ -126,7 +126,9 @@ fn benchBlocking(allocator: std.mem.Allocator, stdout: anytype) !void {
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
-    const stdout = std.io.getStdOut().writer();
+    var buf: [4096]u8 = undefined;
+    var fw = std.fs.File.stdout().writer(&buf);
+    const stdout = &fw.interface;
 
     try stdout.print("zig-concurrent-queue benchmark\n", .{});
     try stdout.print("  producers: {d}  consumers: {d}  items/producer: {d}\n\n", .{
@@ -137,4 +139,6 @@ pub fn main() !void {
 
     const skip_blocking = std.process.getEnvVarOwned(allocator, "SKIP_BLOCKING") catch null;
     if (skip_blocking) |s| allocator.free(s) else try benchBlocking(allocator, stdout);
+
+    try stdout.flush();
 }

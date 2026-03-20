@@ -6,7 +6,8 @@ const PB = Q.ProducerBase;
 const Block = Q.Block;
 
 pub fn main() !void {
-    const w = std.io.getStdOut().writer();
+    var buf: [4096]u8 = undefined;
+    const w = std.fs.File.stdout().writer(&buf);
 
     try w.print("=== Zig struct sizes ===\n", .{});
     try w.print("ConcurrentQueue:    {d} bytes\n", .{@sizeOf(Q)});
