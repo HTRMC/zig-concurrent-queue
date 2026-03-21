@@ -794,6 +794,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             current_producer: ?*ProducerBase,
             desired_producer: ?*ProducerBase,
             current_explicit: ?*ExplicitProducer = null,
+            assigned_prod_count: usize = 0,
         };
 
         // ================================================================
@@ -1116,9 +1117,13 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         }
 
         pub inline fn tryDequeue(self: *Self, token: *ConsumerToken) ?T {
-            // Check rotation FIRST on every call (matching C++ exactly)
+            // Check rotation and producer-count changes on every call.
+            // The prod_count check costs one monotonic load (free on x86)
+            // and ensures consumers re-distribute immediately when new
+            // producers register, eliminating 2P/2C lockstep.
             if (token.desired_producer == null or
-                token.last_known_global_offset != self.global_explicit_consumer_offset.load(.monotonic))
+                token.last_known_global_offset != self.global_explicit_consumer_offset.load(.monotonic) or
+                token.assigned_prod_count != self.producer_count.load(.monotonic))
             {
                 @branchHint(.unlikely);
                 if (!self.updateConsumerAfterRotation(token)) return null;
@@ -1205,10 +1210,6 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                 const item = self.dequeueFromProducer(p);
                 if (item) |v| {
                     token.current_producer = p;
-                    // Also update desired_producer so the next rotation advances
-                    // from this position. This breaks lockstep at 2P/2C where both
-                    // consumers otherwise rotate in sync forever.
-                    token.desired_producer = p;
                     token.current_explicit = if (p.is_explicit)
                         @as(*ExplicitProducer, @fieldParentPtr("base", p))
                     else
@@ -1232,8 +1233,17 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             if (prod_count == 0) return false;
             const global = self.global_explicit_consumer_offset.load(.monotonic);
 
+            // If producer count changed since our assignment, re-distribute.
+            // This breaks lockstep at 2P/2C: both consumers initially land on
+            // the same producer (only 1 registered), and without this check
+            // they rotate in sync forever. Re-assigning with the true count
+            // gives each consumer a unique position via initial_offset.
+            if (token.desired_producer != null and token.assigned_prod_count != prod_count) {
+                token.desired_producer = null;
+            }
+
             if (token.desired_producer == null) {
-                // First time — find starting position
+                // First time (or re-distribution) — find starting position
                 const offset = prod_count - 1 - (token.initial_offset % prod_count);
                 token.desired_producer = tail;
                 var i: usize = 0;
@@ -1242,6 +1252,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                         token.desired_producer = dp.next_producer.load(.acquire);
                     if (token.desired_producer == null) token.desired_producer = tail;
                 }
+                token.assigned_prod_count = prod_count;
             } else {
                 // Rotation — advance by delta
                 var delta = global -% token.last_known_global_offset;
