@@ -1196,7 +1196,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             }
         }
 
-        fn tryDequeueFromAnyProducer(self: *Self, token: *ConsumerToken) ?T {
+        noinline fn tryDequeueFromAnyProducer(self: *Self, token: *ConsumerToken) ?T {
             // Start from current_producer->next_prod() to avoid re-trying
             // the producer that just failed.
             const tail = self.producer_list.load(.acquire);
@@ -1222,7 +1222,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             return null;
         }
 
-        fn updateConsumerAfterRotation(self: *Self, token: *ConsumerToken) bool {
+        noinline fn updateConsumerAfterRotation(self: *Self, token: *ConsumerToken) bool {
             const tail = self.producer_list.load(.acquire);
             if (token.desired_producer == null and tail == null) return false;
 
