@@ -1117,12 +1117,8 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
         }
 
         pub inline fn tryDequeue(self: *Self, token: *ConsumerToken) ?T {
-            // Check rotation on every call, and producer-count changes once
-            // per rotation cycle (when items_consumed == 0) to avoid
-            // cache-line bouncing on producer_count with many consumers.
             if (token.desired_producer == null or
-                token.last_known_global_offset != self.global_explicit_consumer_offset.load(.monotonic) or
-                (token.items_consumed == 0 and token.assigned_prod_count != self.producer_count.load(.monotonic)))
+                token.last_known_global_offset != self.global_explicit_consumer_offset.load(.monotonic))
             {
                 @branchHint(.unlikely);
                 if (!self.updateConsumerAfterRotation(token)) return null;
