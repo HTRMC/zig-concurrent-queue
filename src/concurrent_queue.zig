@@ -1135,6 +1135,14 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
                     return item;
                 }
             }
+            // Queue empty — check if new producers registered (fixes 2P/2C lockstep).
+            // This is on the cold path so the producer_count load doesn't hurt 1P/16C.
+            if (token.assigned_prod_count != 0 and
+                token.assigned_prod_count != self.producer_count.load(.monotonic))
+            {
+                token.desired_producer = null;
+                if (!self.updateConsumerAfterRotation(token)) return null;
+            }
             return self.tryDequeueFromAnyProducer(token);
         }
 
