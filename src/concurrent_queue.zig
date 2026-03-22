@@ -1116,7 +1116,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime traits: Traits) type {
             return token.explicit.enqueueBulk(self, items);
         }
 
-        pub inline fn tryDequeue(self: *Self, token: *ConsumerToken) ?T {
+        pub fn tryDequeue(self: *Self, token: *ConsumerToken) ?T {
             if (token.desired_producer == null or
                 token.last_known_global_offset != self.global_explicit_consumer_offset.load(.monotonic))
             {
